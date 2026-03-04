@@ -1,127 +1,127 @@
-using System;
+using System.Data.Odbc;
 using System.Net;
 using System.Net.Sockets;
-using System.IO;
-using System.Threading;
-using System.Data;
-using System.Data.Odbc;
+using System.Text;
 
-namespace RemedyServer
+namespace RemedyServer;
+
+public static class RemedyServerProgram
 {
-    public class RemedyServer
-    {
-        public static void Main()
-        {
-            TcpListener server = new TcpListener(IPAddress.Any, 9090);
-            server.Start();
-            OdbcConnection dbConn;
-            string conString;
-            while (true)
-            {
-                Console.WriteLine("Waiting for Client...");
+    private const int Port = 9090;
+    private static int _connectionCount;
 
-                Console.WriteLine("Waiting for clients on port 9090");
-                while (true)
-                {
-                    try
-                    {
-                        TcpClient client = server.AcceptTcpClient();
-                        conString = "Driver={Microsoft Access Driver (*.mdb)};DBQ=Remedy.mdb";
-                        //check http://www.connectionstrings.com/ for accessing other databases/adapters
-                        dbConn = new OdbcConnection(conString);
-                        dbConn.Open();
-                        ConnectionHandler handler = new ConnectionHandler(client.Client, dbConn);
-                        ThreadPool.QueueUserWorkItem(new WaitCallback(handler.HandleConnection));
-                    }
-                    catch (Exception)
-                    {
-                        Console.WriteLine("Connection failed on port 9090");
-                    }
-                }
-            }
-        }
-    }
-    class ConnectionHandler
+    public static async Task Main(string[] args)
     {
-        private Socket client;
-        private NetworkStream ns;
-        private StreamReader reader;
-        private StreamWriter writer;
-        private OdbcConnection dbConn;
-        private OdbcCommand sqlCommand;
-        private OdbcDataReader dbReader;
-        private static int connections = 0;
-        private string line, userName, password;
-        public ConnectionHandler(Socket client, OdbcConnection dbConn)
-        {
-            this.dbConn = dbConn;
-            this.client = client;
-        }
-        public void HandleConnection(Object state)
+        using var server = new TcpListener(IPAddress.Any, Port);
+        server.Start();
+        Console.WriteLine($"Waiting for clients on port {Port}");
+
+        while (true)
         {
             try
             {
-                ns = new NetworkStream(client);
-                reader = new StreamReader(ns);
-                writer = new StreamWriter(ns);
-                connections++;
-                Console.WriteLine("New client accepted: {0} active connections", connections);
-                writer.WriteLine("Welcome to my server");
-                writer.Flush();
-                line = null;
-                try
-                {
-                    line = reader.ReadLine();
-                    if (line.Trim().Equals("Auth"))
-                    {
-                        userName = reader.ReadLine();
-                        password = reader.ReadLine();
-
-                        string auth = "SELECT * FROM User_Information WHERE Name='" + userName +
-                            "' AND Password='" + password + "'";
-
-                        sqlCommand = new OdbcCommand(auth, dbConn);
-                        sqlCommand.ExecuteNonQuery();
-                        dbReader = sqlCommand.ExecuteReader();
-                        if (dbReader.Read())
-                        {
-                            writer.WriteLine("Auth OK");
-                            writer.Flush();
-                            writer.WriteLine("Welcome " + dbReader.GetString(3));
-                            writer.Flush();
-                            if (dbReader.GetString(3).Equals("Leader"))
-                                new HandleLeader(dbConn, ns, reader, writer, userName);
-                            else if (dbReader.GetString(3).Equals("Member"))
-                                new HandleMember(dbConn, ns, reader, writer, userName);
-                            else if (dbReader.GetString(3).Equals("System"))
-                                new HandleSystem(dbConn, reader, writer);
-                        }
-                        else
-                            writer.WriteLine("Auth not OK");
-                    }
-                    else if (line.Trim().Equals("Quit"))
-                        goto Skip;
-                }
-                catch (SocketException)
-                {
-                    writer.WriteLine("Error"); writer.Flush();
-                }
-                catch
-                {
-                }
-                Skip:
-                client.Close();
-                ns.Close();
-                dbConn.Close();
-                connections--;
-                Console.WriteLine("Client disconnected: {0}active connections", connections);
+                TcpClient client = await server.AcceptTcpClientAsync();
+                _ = Task.Run(() => HandleConnectionAsync(client));
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                connections--;
-                Console.WriteLine("Client disconnected: {0} active connections", connections);
+                Console.WriteLine($"Accept failed: {ex.Message}");
             }
         }
     }
-}
 
+    private static async Task HandleConnectionAsync(TcpClient client)
+    {
+        const string connectionString = "Driver={Microsoft Access Driver (*.mdb)};DBQ=Remedy.mdb";
+        await using var dbConn = new OdbcConnection(connectionString);
+        try
+        {
+            await dbConn.OpenAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Database connection failed: {ex.Message}");
+            client.Dispose();
+            return;
+        }
+
+        try
+        {
+            using (client)
+            using (var ns = client.GetStream())
+            using (var reader = new StreamReader(ns, Encoding.UTF8))
+            using (var writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true })
+            {
+                Interlocked.Increment(ref _connectionCount);
+                Console.WriteLine($"New client accepted: {_connectionCount} active connections");
+
+                await writer.WriteLineAsync("Welcome to my server");
+
+                string? line = await reader.ReadLineAsync();
+                if (string.IsNullOrWhiteSpace(line))
+                    return;
+
+                if (line.Trim().Equals("Auth", StringComparison.OrdinalIgnoreCase))
+                {
+                    string? userName = await reader.ReadLineAsync();
+                    string? password = await reader.ReadLineAsync();
+                    if (string.IsNullOrEmpty(userName) || string.IsNullOrEmpty(password))
+                    {
+                        await writer.WriteLineAsync("Auth not OK");
+                        return;
+                    }
+
+                    const string authSql = "SELECT * FROM User_Information WHERE Name=? AND Password=?";
+                    await using var sqlCommand = new OdbcCommand(authSql, dbConn);
+                    sqlCommand.Parameters.AddWithValue("@name", userName);
+                    sqlCommand.Parameters.AddWithValue("@password", password);
+                    await using var dbReader = await sqlCommand.ExecuteReaderAsync();
+
+                    if (await dbReader.ReadAsync())
+                    {
+                        await writer.WriteLineAsync("Auth OK");
+                        string role = dbReader.GetString(3);
+                        await writer.WriteLineAsync($"Welcome {role}");
+
+                        switch (role)
+                        {
+                            case "Leader":
+                                new HandleLeader(dbConn, ns, reader, writer, userName);
+                                break;
+                            case "Member":
+                                new HandleMember(dbConn, ns, reader, writer, userName);
+                                break;
+                            case "System":
+                                new HandleSystem(dbConn, reader, writer);
+                                break;
+                            default:
+                                await writer.WriteLineAsync("Unknown role");
+                                break;
+                        }
+                    }
+                    else
+                    {
+                        await writer.WriteLineAsync("Auth not OK");
+                    }
+                }
+                else if (line.Trim().Equals("Quit", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Client requested quit without auth
+                }
+            }
+        }
+        catch (SocketException)
+        {
+            // Client disconnected
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Connection error: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _connectionCount);
+            Console.WriteLine($"Client disconnected: {_connectionCount} active connections");
+        }
+    }
+}

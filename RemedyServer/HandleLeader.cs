@@ -1,273 +1,253 @@
-using System;
-using System.Net;
-using System.Net.Sockets;
-using System.IO;
-using System.Threading;
-using System.Data;
 using System.Data.Odbc;
-using System.Text;
-/* Created By: Brahim Al-Hawwas
- * Last Modified: 7:35 13/12/2007
- * Notices: Tested with telnet, but file reading does not work
- * 
- */
-namespace RemedyServer
+
+namespace RemedyServer;
+
+/// <summary>
+/// Handles leader-role commands (tickets, members, attachments).
+/// </summary>
+internal sealed class HandleLeader
 {
-    class HandleLeader
+    private readonly OdbcConnection _dbConn;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+    private readonly HandleFile _fileHandler;
+    private readonly string _userName;
+
+    private OdbcCommand? _sqlCommand;
+    private OdbcDataReader? _dbReader;
+    private string? _line;
+    private string? _assigned;
+    private string? _memEmail;
+    private string? _fileName;
+    private string? _requirements;
+    private string? _dueDate;
+    private string? _memName;
+    private string? _email;
+    private string? _password;
+    private string? _body;
+    private string? _subject;
+    private string[] _fileNames = Array.Empty<string>();
+    private int _fileNumber;
+    private int _fileLength;
+    private int _seq;
+    private int _ticketNum;
+
+    public HandleLeader(OdbcConnection dbConn, System.Net.Sockets.NetworkStream ns, StreamReader reader, StreamWriter writer, string userName)
     {
-        private NetworkStream ns;
-        private StreamReader reader;
-        private StreamWriter writer;
-        private OdbcConnection dbConn;
-        private OdbcCommand sqlCommand;
-        private OdbcDataReader dbReader;
-        private Handle_File fileHandler;
-        private string line, command, userName, assigned, memEmail,fileName, requirenments;
-        private string due_Date, memName, email, password, body, subject;
-        private string[] fileNames;
-        private int fileNumber,fileLength, seq, ticketNum;
-        public HandleLeader(OdbcConnection dbConn,NetworkStream ns, StreamReader reader, StreamWriter writer, string userName)
+        _dbConn = dbConn;
+        _reader = reader;
+        _writer = writer;
+        _userName = userName;
+        _fileHandler = new HandleFile(ns, reader, writer);
+        BeginHandling();
+    }
+
+    public void BeginHandling()
+    {
+        try
         {
-            this.dbConn = dbConn;
-            this.reader = reader;
-            this.writer = writer;
-            this.ns = ns;
-            this.userName = userName;
-            fileHandler = new Handle_File(ns, reader, writer);
-            BeginHandling();
+            _email = DbHandler.GetEmail(_userName, _dbConn);
+            const string sql = "SELECT T.Number, T.Issue_Date, I.Assigned, I.Status, I.Due_Date " +
+                               "FROM Ticket AS T, Ticket_Information AS I WHERE T.Number=I.Number AND T.Assigner =?";
+            _sqlCommand = new OdbcCommand(sql, _dbConn);
+            _sqlCommand.Parameters.AddWithValue("@assigner", _userName);
+            _dbReader = _sqlCommand.ExecuteReader();
+            while (_dbReader.Read())
+            {
+                _line = string.Join("##", Enumerable.Range(0, _dbReader.FieldCount - 1).Select(i => _dbReader.GetString(i)));
+                _writer.WriteLine(_line);
+                _writer.Flush();
+            }
+            _writer.WriteLine(".");
+            _writer.Flush();
+            DbHandler.DisposeAll(_sqlCommand, _dbReader);
+            _sqlCommand = null;
+            _dbReader = null;
+            WaitForQueries();
         }
-        public void BeginHandling()//initializing the leader handler
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Database error: {ex.Message}");
+            DbHandler.DisposeAll(_sqlCommand, _dbReader);
+        }
+    }
+
+    public void WaitForQueries()
+    {
+        while (true)
         {
             try
             {
-                email = DB_Handler.GetEmail(userName, dbConn);
-                // command = " SELECT T.Number, T.Issue_Date, I.Assigned, I.Attachment, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements" +
-                //        " FROM Ticket AS T, Ticket_Information AS I WHERE T.Number=I.Number";
-                command = " SELECT T.Number, T.Issue_Date, I.Assigned,I.Status, I.Due_Date" +
-                        " FROM Ticket AS T, Ticket_Information AS I WHERE T.Number=I.Number AND T.Assigner ='" + userName + "'";
-                sqlCommand = new OdbcCommand(command, dbConn);
-                dbReader = sqlCommand.ExecuteReader();
-                while (dbReader.Read())
+                _line = _reader.ReadLine();
+                switch (_line)
                 {
-                    line = "";//empty the line so you can read the next row
-                    for (int i = 0; i < dbReader.FieldCount-1; i++)
-                    {
-                        line += dbReader.GetString(i) + "##";// but the whole row in one column and send it, seperated by commas
-                    }
-                    writer.WriteLine(line);
-                    writer.Flush();
-                }
-                writer.WriteLine(".");// end of reading from the database
-                writer.Flush();
-                DB_Handler.DisposeAll(sqlCommand, dbReader);
-                WaitForQueries();
-            }
-            catch
-            {
-                Console.WriteLine(" The Database is down please try again later");//for debugging server
-                DB_Handler.DisposeAll(sqlCommand, dbReader);
-            }
-        }
-        public void WaitForQueries()
-        {
-            do
-            {
-                try
-                {
-                    line = reader.ReadLine();//reader the command the user wants to issue
-                    switch (line)
-                    {
-                        case "Create Ticket":
-                            SendMemNum();
-                            SendMembers();
-                            seq = int.Parse(reader.ReadLine());
-                            Console.WriteLine("the sequence is  " + seq);
-                            CreateTicket();//Create an initial ticket that is mapped to Ticket Table
-                            for (int i = 1; i <= seq; i++)
-                                ReadTicket(i);
-                            //end of reading the number of members and sending it to client
-                            writer.WriteLine("OK");
-                            writer.Flush();
-                            break;
-
-                        case "Create Member":
-                            memName = reader.ReadLine();
-                            memEmail = reader.ReadLine();
-                            password = reader.ReadLine();
-                            body = "Dear " + memName + " :\n Welcome to our Group that is lead by " + 
-                                userName + "\n name: " + memName + "\n password: " + password;
-                            Mail_Sender.SendMail(email, memEmail, "You are joining a new group", body); 
-                            command = "INSERT INTO User_Information Values('" + memName + "','" + memEmail + "','" + password +"','Member')";//name,email,pass
-                            sqlCommand = new OdbcCommand(command, dbConn);
-                            sqlCommand.ExecuteNonQuery();
+                    case "Create Ticket":
+                        SendMemNum();
+                        SendMembers();
+                        _seq = int.Parse(_reader.ReadLine() ?? "0");
+                        CreateTicket();
+                        for (int i = 1; i <= _seq; i++)
+                            ReadTicket(i);
+                        _writer.WriteLine("OK");
+                        _writer.Flush();
+                        break;
+                    case "Create Member":
+                        _memName = _reader.ReadLine();
+                        _memEmail = _reader.ReadLine();
+                        _password = _reader.ReadLine();
+                        _body = $"Dear {_memName} :\nWelcome to our Group that is lead by {_userName}\nname: {_memName}\npassword: {_password}";
+                        MailSender.SendMail(_email!, _memEmail!, "You are joining a new group", _body);
+                        _sqlCommand = new OdbcCommand("INSERT INTO User_Information VALUES(?,?,?,'Member')", _dbConn);
+                        _sqlCommand.Parameters.AddWithValue("@name", _memName);
+                        _sqlCommand.Parameters.AddWithValue("@email", _memEmail);
+                        _sqlCommand.Parameters.AddWithValue("@password", _password);
+                        _sqlCommand.ExecuteNonQuery();
+                        AcceptedCommand();
+                        break;
+                    case "Ticket Info":
+                        GetTicketInfo();
+                        AcceptedCommand();
+                        break;
+                    case "Get Attachment":
+                        GetAttachment();
+                        AcceptedCommand();
+                        break;
+                    case "Delete Member":
+                        try
+                        {
+                            _memName = _reader.ReadLine();
+                            _sqlCommand = new OdbcCommand("DELETE FROM User_Information WHERE Name=? AND Role='Member'", _dbConn);
+                            _sqlCommand.Parameters.AddWithValue("@name", _memName);
+                            _sqlCommand.ExecuteNonQuery();
                             AcceptedCommand();
-                            break;
-
-                        case "Ticket Info":
-                            GetTicketInfo();
-                            AcceptedCommand();
-                            break;
-
-                        case "Get Attachment":
-                            GetAttachment();
-                            AcceptedCommand();
-                            break;
-
-                        case "Delete Member":
-                            try
-                            {
-                                memName = reader.ReadLine();
-                                command = "DELETE FROM User_Information WHERE Name ='" + memName + "' AND Role = 'Member'";
-                                sqlCommand = new OdbcCommand(command, dbConn);
-                                sqlCommand.ExecuteNonQuery();
-                                AcceptedCommand();
-                            }
-                            catch
-                            {
-                                writer.WriteLine("Not OK");
-                                writer.Flush();
-                            }
-                            break;
-
-                        case "Referesh":
-                            BeginHandling();
-                            break;
-
-                        case "Quit":
-                            line = "break";
-                            break;
-
-                        default:
-                            writer.WriteLine("not known Command");
-                            writer.Flush();
-                            break;
-                    }
+                        }
+                        catch
+                        {
+                            _writer.WriteLine("Not OK");
+                            _writer.Flush();
+                        }
+                        break;
+                    case "Referesh":
+                        BeginHandling();
+                        break;
+                    case "Quit":
+                        return;
+                    default:
+                        _writer.WriteLine("not known Command");
+                        _writer.Flush();
+                        break;
                 }
-                catch
-                {
-                    Console.WriteLine(" The Database is down please try again later");//for debugging server only
-                }
-            } while (line!="break");
-        }
-        
-        public void SendMemNum()
-        {
-            command = "SELECT COUNT(*) FROM User_Information WHERE ROLE='Member'";
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            dbReader.Read();
-            Console.WriteLine(" I have got the count" + dbReader.GetString(0));
-            writer.WriteLine(dbReader.GetString(0));
-            writer.Flush();
-        }
-        public void SendMembers()
-        {
-            command = "SELECT Name FROM User_Information WHERE Role='Member'";
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            while (dbReader.Read())
+            }
+            catch (Exception ex)
             {
-                writer.WriteLine(dbReader.GetString(0));
-                writer.Flush();
+                Console.WriteLine($"Database error: {ex.Message}");
             }
         }
-        public void ReadTicket(int sequence)
+    }
+
+    public void SendMemNum()
+    {
+        _sqlCommand = new OdbcCommand("SELECT COUNT(*) FROM User_Information WHERE ROLE='Member'", _dbConn);
+        _dbReader = _sqlCommand.ExecuteReader();
+        if (_dbReader.Read())
+            _writer.WriteLine(_dbReader.GetString(0));
+        _writer.Flush();
+    }
+
+    public void SendMembers()
+    {
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+        _sqlCommand = new OdbcCommand("SELECT Name FROM User_Information WHERE Role='Member'", _dbConn);
+        _dbReader = _sqlCommand.ExecuteReader();
+        while (_dbReader.Read())
         {
-            assigned = reader.ReadLine();
-            Console.WriteLine("The assigned is: "+assigned);
-            fileNumber = int.Parse(reader.ReadLine());
-            Console.WriteLine("The number of files are: "+fileNumber);
-            fileNames = new string[fileNumber];
-            for (int i = fileNumber; i > 0; i--)
-            {
-                Console.WriteLine("Reading the file #: " + i);
-                fileName = reader.ReadLine();
-                Console.WriteLine("The file Name is: "+fileName);
-                fileNames[i - 1] = fileName;
-                fileLength = int.Parse(reader.ReadLine());
-                Console.WriteLine("The File Length is: " + fileLength);
-                fileHandler.ReadAttachments(ticketNum, assigned, fileName, fileLength);//uploading attachment to the server
-                Console.WriteLine("I have read the attachments");
-            }
-            requirenments = reader.ReadLine();// reading the requirements
-            Console.WriteLine("The req are " + requirenments);
-            due_Date = reader.ReadLine();//reading the due-date
-            Console.WriteLine("the Due_date is: " + due_Date);
-            
-            string allFiles="##";
-            for (int i = 0; i < fileNumber; i++)
-            {
-                allFiles += fileNames[i]+"##"; //seperate files by ## and insert their names to the database
-            }
-            if (sequence == 1)
-            {
-                command = "INSERT INTO Ticket_Information " +
-                    "Values('" + ticketNum + "','" + assigned + "','" + allFiles + "','None','Assigned','" + sequence + "',#" + due_Date + "#,'" + requirenments + "')";
-                subject = "You have been Assigned a ticket";
-                body = "Dear " + assigned + ":\n You have been assigned a Ticket having a number: " +
-                    ticketNum + ", The Due Date is: " + due_Date + "\n\n Open Your Remedy Client for more info";
-                
-            }
-            else
-            {
-                command = "INSERT INTO Ticket_Information " +
-                        "Values('" + ticketNum + "','" + assigned + "','" + allFiles + "','None','Waiting','" + sequence + "',#" + due_Date + "#,'" + requirenments + "')";
-                subject = "You have been Assigned a ticket but waiting in Sequence";
-                body = "Dear " + assigned + ":\n You have been assigned a Ticket having a number: " +
-                    ticketNum + ", The Due Date is: " + due_Date + "\n\n Open Your Remedy Client for more info";
-                
-            }
-            memEmail = DB_Handler.GetEmail(assigned,dbConn);
-            Mail_Sender.SendMail(email, memEmail, subject, body);
-            sqlCommand = new OdbcCommand(command, dbConn);
-            sqlCommand.ExecuteNonQuery();
+            _writer.WriteLine(_dbReader.GetString(0));
+            _writer.Flush();
         }
-        public void CreateTicket()//No reading/writing   from/to the user, Just setting the ticketNum
+    }
+
+    public void ReadTicket(int sequence)
+    {
+        _assigned = _reader.ReadLine();
+        _fileNumber = int.Parse(_reader.ReadLine() ?? "0");
+        _fileNames = new string[_fileNumber];
+        for (int i = _fileNumber; i > 0; i--)
         {
-            DateTime date = System.DateTime.Now;
-            command = "INSERT INTO Ticket (Assigner, Issue_Date) Values('" + userName + "','" + date + "')";
-            sqlCommand = new OdbcCommand(command, dbConn);
-            sqlCommand.ExecuteNonQuery();
-            command = " SELECT Number" +
-                        " FROM Ticket WHERE Issue_Date=#" + date + "#";
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            dbReader.Read();
-            ticketNum = int.Parse(dbReader.GetString(0));
+            _fileName = _reader.ReadLine();
+            _fileNames[i - 1] = _fileName!;
+            _fileLength = int.Parse(_reader.ReadLine() ?? "0");
+            _fileHandler.ReadAttachments(_ticketNum, _assigned!, _fileName!, _fileLength);
         }
-        public void GetTicketInfo()
+        _requirements = _reader.ReadLine();
+        _dueDate = _reader.ReadLine();
+        var allFiles = "##" + string.Join("##", _fileNames) + "##";
+        string status = sequence == 1 ? "Assigned" : "Waiting";
+        _sqlCommand = new OdbcCommand(
+            "INSERT INTO Ticket_Information (Number, Assigned, Attachment, JobDone, Status, Sequence, Due_Date, Requirements) VALUES(?,?,?,'None',?," + sequence + ",?,?)", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _assigned);
+        _sqlCommand.Parameters.AddWithValue("@files", allFiles);
+        _sqlCommand.Parameters.AddWithValue("@status", status);
+        _sqlCommand.Parameters.AddWithValue("@due", _dueDate);
+        _sqlCommand.Parameters.AddWithValue("@req", _requirements ?? "");
+        _sqlCommand.ExecuteNonQuery();
+
+        _subject = sequence == 1 ? "You have been Assigned a ticket" : "You have been Assigned a ticket but waiting in Sequence";
+        _body = $"Dear {_assigned}:\nYou have been assigned a Ticket having a number: {_ticketNum}, The Due Date is: {_dueDate}\n\nOpen Your Remedy Client for more info";
+        _memEmail = DbHandler.GetEmail(_assigned!, _dbConn);
+        if (_memEmail is { } email)
+            MailSender.SendMail(_email!, email, _subject, _body);
+    }
+
+    public void CreateTicket()
+    {
+        var date = DateTime.Now;
+        _sqlCommand = new OdbcCommand("INSERT INTO Ticket (Assigner, Issue_Date) VALUES(?,?)", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@assigner", _userName);
+        _sqlCommand.Parameters.AddWithValue("@date", date);
+        _sqlCommand.ExecuteNonQuery();
+        _sqlCommand = new OdbcCommand("SELECT Number FROM Ticket WHERE Issue_Date=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@date", date);
+        _dbReader = _sqlCommand.ExecuteReader();
+        if (_dbReader.Read())
+            _ticketNum = int.Parse(_dbReader.GetString(0));
+    }
+
+    public void GetTicketInfo()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _assigned = _reader.ReadLine();
+        _sqlCommand = new OdbcCommand(
+            "SELECT T.Number, T.Issue_Date, I.Assigned, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements, I.Attachment " +
+            "FROM Ticket_Information AS I, Ticket AS T WHERE I.Assigned=? AND T.Number=? AND T.Number=I.Number",
+            _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _assigned);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _dbReader = _sqlCommand.ExecuteReader();
+        while (_dbReader.Read())
         {
-            ticketNum = int.Parse(reader.ReadLine());//get the ticket number you want to handle
-            assigned = reader.ReadLine();
-            command = "SELECT T.Number, T.Issue_Date,I.Assigned, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements, I.Attachment " +
-                "FROM Ticket_Information AS I, Ticket AS T WHERE I.Assigned = '"+assigned+"'AND T.Number=" + ticketNum + " AND T.Number=I.Number";//name,email,pass
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            while (dbReader.Read())
-            {
-                line = "";//empty the line so you can read the next row
-                for (int i = 0; i < dbReader.FieldCount ; i++)
-                {
-                    line += dbReader.GetString(i) + "##";// but the whole row in one column and send it, seperated by ##
-                }
-                writer.WriteLine(line);
-                writer.Flush();
-            }
-            writer.WriteLine(".");//sending the end of tickets info
-            writer.Flush();
+            _line = string.Join("##", Enumerable.Range(0, _dbReader.FieldCount).Select(i => _dbReader.GetString(i)));
+            _writer.WriteLine(_line);
+            _writer.Flush();
         }
-        public void GetAttachment()
-        {
-            ticketNum = int.Parse(reader.ReadLine());
-            assigned = reader.ReadLine().Trim();
-            fileName = reader.ReadLine().Trim();
-            fileHandler.GetAttachment(ticketNum, assigned, fileName);
-        }
-        public void AcceptedCommand()
-        {
-            writer.WriteLine("OK");//I am accepting the command and I have executed it
-            writer.Flush();
-            DB_Handler.DisposeAll(sqlCommand, dbReader);
-        }
+        _writer.WriteLine(".");
+        _writer.Flush();
+    }
+
+    public void GetAttachment()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _assigned = _reader.ReadLine()?.Trim();
+        _fileName = _reader.ReadLine()?.Trim();
+        _fileHandler.GetAttachment(_ticketNum, _assigned!, _fileName!);
+    }
+
+    private void AcceptedCommand()
+    {
+        _writer.WriteLine("OK");
+        _writer.Flush();
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+        _sqlCommand = null;
+        _dbReader = null;
     }
 }

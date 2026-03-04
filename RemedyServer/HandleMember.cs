@@ -1,211 +1,234 @@
-using System;
-using System.Text;
-using System.Net;
-using System.Net.Sockets;
-using System.IO;
-using System.Threading;
-using System.Data;
 using System.Data.Odbc;
 
-namespace RemedyServer
+namespace RemedyServer;
+
+internal sealed class HandleMember
 {
-    class HandleMember
+    private readonly OdbcConnection _dbConn;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+    private readonly HandleFile _fileHandler;
+    private readonly string _userName;
+
+    private OdbcCommand? _sqlCommand;
+    private OdbcDataReader? _dbReader;
+    private string? _line;
+    private string? _fileName;
+    private string? _jobDone;
+    private string? _successor;
+    private string _allFiles = "";
+    private int _ticketNum;
+    private int _fileNumber;
+    private int _fileLength;
+    private string[] _fileNames = Array.Empty<string>();
+
+    public HandleMember(OdbcConnection dbConn, System.Net.Sockets.NetworkStream ns, StreamReader reader, StreamWriter writer, string userName)
     {
-        private NetworkStream ns;
-        private StreamReader reader;
-        private StreamWriter writer;
-        private OdbcConnection dbConn;
-        private OdbcCommand sqlCommand;
-        private OdbcDataReader dbReader;
-        private Handle_File fileHandler;
-        private string line, userName, command, fileName, jobDone, successor, allFiles = "";
-        private int ticketNum, fileNumber, fileLength;
-        private string[] fileNames;
-        public HandleMember(OdbcConnection dbConn, NetworkStream ns, StreamReader reader, StreamWriter writer, string userName)
+        _dbConn = dbConn;
+        _reader = reader;
+        _writer = writer;
+        _userName = userName;
+        _fileHandler = new HandleFile(ns, reader, writer);
+        BeginHandling();
+    }
+
+    public void BeginHandling()
+    {
+        try
         {
-            this.dbConn = dbConn;
-            this.reader = reader;
-            this.writer = writer;
-            this.ns = ns;
-            this.userName = userName;
-            fileHandler = new Handle_File(ns, reader, writer);
-            BeginHandling();
+            _sqlCommand = new OdbcCommand(
+                "SELECT T.Number, T.Assigner, T.Issue_Date, I.Assigned, I.Attachment, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements " +
+                "FROM Ticket AS T, Ticket_Information AS I WHERE T.Number=I.Number AND I.Assigned=? " +
+                "AND (I.Status='Assigned' OR I.Status='Waiting' OR I.Status='Work_In_Progress') AND I.Due_Date>?",
+                _dbConn);
+            _sqlCommand.Parameters.AddWithValue("@assigned", _userName);
+            _sqlCommand.Parameters.AddWithValue("@now", DateTime.Now);
+            _dbReader = _sqlCommand.ExecuteReader();
+            while (_dbReader.Read())
+            {
+                _line = string.Join("##", Enumerable.Range(0, _dbReader.FieldCount - 1).Select(i => _dbReader.GetString(i)));
+                _writer.WriteLine(_line);
+                _writer.Flush();
+            }
+            _writer.WriteLine(".");
+            _writer.Flush();
+            DbHandler.DisposeAll(_sqlCommand, _dbReader);
+            _sqlCommand = null;
+            _dbReader = null;
+            WaitForQueries();
         }
-        public void BeginHandling()//initializing the leader handler
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Database error: {ex.Message}");
+        }
+    }
+
+    public void WaitForQueries()
+    {
+        while (true)
         {
             try
             {
-                //writer.WriteLine("I am not done");
-                command = " SELECT T.Number, T.Assigner, T.Issue_Date, I.Assigned, I.Attachment, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements" +
-                        " FROM Ticket AS T, Ticket_Information AS I" +
-                        " WHERE T.Number=I.Number AND I.Assigned='" + userName + 
-                        "' AND (I.Status = 'Assigned' OR I.Status='Waiting' OR I.Status='Work_In_Progress') AND I.Due_Date > #" + System.DateTime.Now + "#";
-                sqlCommand = new OdbcCommand(command, dbConn);
-                dbReader = sqlCommand.ExecuteReader();
-                //Console.WriteLine("I am done");
-                while (dbReader.Read())
+                _line = _reader.ReadLine();
+                switch (_line)
                 {
-                    line = "";//empty the line so you can read the next row
-                    for (int i = 0; i < dbReader.FieldCount - 1; i++)
-                    {
-                        line += dbReader.GetString(i) + "##";// but the whole row in one column and send it, seperated by commas
-                    }
-                    writer.WriteLine(line);
-                    writer.Flush();
+                    case "Ticket Info":
+                        GetTicketInfo();
+                        AcceptedCommand();
+                        break;
+                    case "Get Attachment":
+                        GetAttachment();
+                        AcceptedCommand();
+                        break;
+                    case "Update Status1":
+                        UpdateStatus1();
+                        AcceptedCommand();
+                        break;
+                    case "Update Status2":
+                        UpdateStatus2();
+                        AcceptedCommand();
+                        break;
+                    case "Quit":
+                        AcceptedCommand();
+                        return;
+                    default:
+                        _writer.WriteLine("not known Command");
+                        _writer.Flush();
+                        break;
                 }
-                writer.WriteLine(".");// end of reading from the database
-                writer.Flush();
-                DB_Handler.DisposeAll(sqlCommand, dbReader);
-                WaitForQueries();
-                //do not forget to close the reader
             }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine(" The Database is down please try again later");//for debugging server
+                Console.WriteLine($"Database error: {ex.Message}");
+                DbHandler.DisposeAll(_sqlCommand, _dbReader);
             }
         }
-        public void WaitForQueries()
+    }
+
+    public void GetTicketInfo()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _sqlCommand = new OdbcCommand(
+            "SELECT T.Number, T.Issue_Date, I.Assigned, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements, I.Attachment " +
+            "FROM Ticket_Information AS I, Ticket AS T WHERE T.Number=? AND T.Number=I.Number AND I.Assigned=?",
+            _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _userName);
+        _dbReader = _sqlCommand.ExecuteReader();
+        while (_dbReader.Read())
         {
-            do
-            {
-                try
-                {
-                    line = reader.ReadLine();//reader the command the user wants to issue
-                    switch (line)
-                    {
-                        case "Ticket Info"://has been tested
-                            GetTicketInfo();
-                            AcceptedCommand();
-                            break;
-                        case "Get Attachment"://has been tested
-                            GetAttachment();
-                            AcceptedCommand();
-                            break;
-                        case "Update Status1":
-                            UpdateStatus1();
-                            AcceptedCommand();
-                            break;
-                        case "Update Status2":
-                            UpdateStatus2();
-                            AcceptedCommand();
-                            break;
-                        case "Quit":
-                            line = "break";
-                            AcceptedCommand();
-                            break;
-                        default:
-                            writer.WriteLine("not known Command");
-                            writer.Flush();
-                            break;
-                    }
-                    
-                }
-                catch
-                {
-                    Console.WriteLine(" The Database is down please try again later");
-                    DB_Handler.DisposeAll(sqlCommand, dbReader);
-                }
-            } while (line!="break");
+            _line = string.Join("##", Enumerable.Range(0, _dbReader.FieldCount - 1).Select(i => _dbReader.GetString(i)));
+            _writer.WriteLine(_line);
+            _writer.Flush();
         }
-        public void GetTicketInfo()
+        _writer.WriteLine(".");
+        _writer.Flush();
+    }
+
+    public void GetAttachment()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _fileName = _reader.ReadLine()?.Trim();
+        _fileHandler.GetAttachment(_ticketNum, _userName, _fileName!);
+    }
+
+    public void UpdateStatus2()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _fileNumber = int.Parse(_reader.ReadLine() ?? "0");
+        _fileNames = new string[_fileNumber];
+        for (int i = _fileNumber; i > 0; i--)
         {
-            ticketNum = int.Parse(reader.ReadLine());//get the ticket number you want to handle
-            command = "SELECT T.Number, T.Issue_Date,I.Assigned, I.JobDone, I.Status, I.Sequence, I.Due_Date, I.Requirements, I.Attachment " +
-                "FROM Ticket_Information AS I, Ticket AS T WHERE T.Number=" + ticketNum + " AND T.Number=I.Number AND I.Assigned='"+userName+"'";//name,email,pass
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            while (dbReader.Read())
+            _fileName = _reader.ReadLine();
+            _fileNames[i - 1] = _fileName!;
+            _fileLength = int.Parse(_reader.ReadLine() ?? "0");
+            _fileHandler.ReadAttachments(_ticketNum, _userName, _fileName!, _fileLength);
+        }
+        _jobDone = _reader.ReadLine();
+        _allFiles = "##" + string.Join("##", _fileNames) + "##";
+        // Access/Jet uses & for string concatenation
+        _sqlCommand = new OdbcCommand(
+            "UPDATE Ticket_Information SET Status='Done', Attachment=[Attachment] & ?, JobDone=? WHERE Assigned=? AND Number=?",
+            _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@files", _allFiles);
+        _sqlCommand.Parameters.AddWithValue("@jobDone", _jobDone);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _userName);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.ExecuteNonQuery();
+        UpdateSuccessor();
+    }
+
+    public void UpdateStatus1()
+    {
+        _ticketNum = int.Parse(_reader.ReadLine() ?? "0");
+        _sqlCommand = new OdbcCommand("UPDATE Ticket_Information SET Status='Work_In_Progress' WHERE Assigned=? AND Number=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _userName);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.ExecuteNonQuery();
+    }
+
+    private void AcceptedCommand()
+    {
+        _writer.WriteLine("OK");
+        _writer.Flush();
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+        _sqlCommand = null;
+        _dbReader = null;
+    }
+
+    public void UpdateSuccessor()
+    {
+        _sqlCommand = new OdbcCommand("SELECT Sequence FROM Ticket_Information WHERE Number=? AND Assigned=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.Parameters.AddWithValue("@assigned", _userName);
+        _dbReader = _sqlCommand.ExecuteReader();
+        if (!_dbReader.Read())
+            return;
+        int seq = int.Parse(_dbReader.GetString(0));
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+
+        _sqlCommand = new OdbcCommand("SELECT MAX(Sequence) FROM Ticket_Information WHERE Number=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _dbReader = _sqlCommand.ExecuteReader();
+        if (!_dbReader.Read())
+            return;
+        int seq2 = int.Parse(_dbReader.GetString(0));
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+
+        if (seq >= seq2)
+            return;
+
+        seq++;
+        _sqlCommand = new OdbcCommand("SELECT Assigned FROM Ticket_Information WHERE Number=? AND Sequence=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.Parameters.AddWithValue("@seq", seq);
+        _dbReader = _sqlCommand.ExecuteReader();
+        if (!_dbReader.Read())
+            return;
+        _successor = _dbReader.GetString(0);
+        DbHandler.DisposeAll(_sqlCommand, _dbReader);
+
+        string[] tokens = _allFiles.Split('#', StringSplitOptions.RemoveEmptyEntries);
+        var destDir = Path.Combine(_successor!, _ticketNum.ToString());
+        Directory.CreateDirectory(destDir);
+        var srcDir = Path.Combine(_userName, _ticketNum.ToString());
+        foreach (string token in tokens)
+        {
+            try
             {
-                line = "";//empty the line so you can read the next row
-                for (int i = 0; i < dbReader.FieldCount - 1; i++)
-                {
-                    line += dbReader.GetString(i) + "##";// but the whole row in one column and send it, seperated by ##
-                }
-                writer.WriteLine(line);
-                writer.Flush();
+                var src = Path.Combine(srcDir, token);
+                var dest = Path.Combine(destDir, token);
+                File.Copy(src, dest, overwrite: true);
             }
-            writer.WriteLine(".");//sending the end of tickets info
-            writer.Flush();
-        }
-        public void GetAttachment()//has been tested
-        {
-            ticketNum = int.Parse(reader.ReadLine());
-            fileName = reader.ReadLine().Trim();
-            fileHandler.GetAttachment(ticketNum, userName, fileName);
-        }
-        public void UpdateStatus2()
-        {
-            ticketNum = int.Parse(reader.ReadLine());
-            fileNumber = int.Parse(reader.ReadLine());
-            fileNames = new string[fileNumber];
-            for (int i = fileNumber; i > 0; i--)
+            catch (Exception ex)
             {
-                Console.WriteLine("Rading the file #: " + i);
-                fileName = reader.ReadLine();
-                fileNames[i - 1] = fileName;
-                fileLength = int.Parse(reader.ReadLine());
-                fileHandler.ReadAttachments(ticketNum, userName, fileName, fileLength);//uploading attachment to the server
+                Console.WriteLine(ex.Message);
             }
-            jobDone = reader.ReadLine();// reading the job done by the client
-            allFiles = "##";
-            for (int i = 0; i < fileNumber; i++)// getting the new files
-                allFiles += fileNames[i] + "##"; //seperate files by ## and insert their names to the database
-            command = " Update Ticket_Information SET Status='Done', Attachment= Attachment + '"+ allFiles +"', JobDone='"+ jobDone +"' WHERE Assigned = '" + userName + "' AND Number=" + ticketNum;
-            sqlCommand = new OdbcCommand(command, dbConn);
-            sqlCommand.ExecuteNonQuery();
-            UpdateSuccessor();
-            
-        }//has been tested
-        public void UpdateStatus1()
-        {
-            ticketNum = int.Parse(reader.ReadLine());
-            command = " Update Ticket_Information SET Status='Work_In_Progress' WHERE Assigned = '" + userName + "' AND Number=" + ticketNum;
-            sqlCommand = new OdbcCommand(command, dbConn);
-            sqlCommand.ExecuteNonQuery();
-        }//has been tested
-        public void AcceptedCommand()
-        {
-            writer.WriteLine("OK");//I am accepting the command and I have executed it
-            writer.Flush();
-            DB_Handler.DisposeAll(sqlCommand, dbReader);
         }
-        public void UpdateSuccessor()
-        {
-            //Updating the Status of the succeding sequence
-            command = "SELECT Sequence FROM Ticket_Information WHERE Number=" + ticketNum + " AND Assigned='" + userName + "'";
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            dbReader.Read();
-            int seq = int.Parse(dbReader.GetString(0));
-            command = "SELECT MAX(Sequence) FROM Ticket_Information WHERE Number=" + ticketNum;
-            sqlCommand = new OdbcCommand(command, dbConn);
-            dbReader = sqlCommand.ExecuteReader();
-            dbReader.Read();
-            int seq2 = int.Parse(dbReader.GetString(0));
-            if (seq < seq2)// means there are successors
-            {
-                command = "SELECT Assigned FROM Ticket_Information WHERE Number=" + ticketNum+" AND Sequence="+(++seq);
-                sqlCommand = new OdbcCommand(command, dbConn);
-                dbReader = sqlCommand.ExecuteReader();
-                dbReader.Read();
-                successor = dbReader.GetString(0);
-                string[] tokens = allFiles.Split('#');
-                Directory.CreateDirectory(successor + "/" + ticketNum);
-                for (int k = 0; k < tokens.Length; k++)
-                {
-                    try
-                    {
-                        File.Copy((userName + "/" + ticketNum + "/" + tokens[k]), (successor + "/" + ticketNum + "/" + tokens[k]),true);
-                    }
-                    catch(Exception ww)
-                    {
-                        Console.WriteLine(ww);//gives an exception but still works !!!!
-                    }
-                }
-                command = " Update Ticket_Information SET Status='Assigned' , Attachment= Attachment + '" + allFiles + "' WHERE  Number=" + ticketNum + " AND Sequence =" + seq;//sequece has been updated earlier
-                sqlCommand = new OdbcCommand(command, dbConn);
-                sqlCommand.ExecuteNonQuery();// even if no one preceeding
-            }   
-        }
+        _sqlCommand = new OdbcCommand("UPDATE Ticket_Information SET Status='Assigned', Attachment=[Attachment] & ? WHERE Number=? AND Sequence=?", _dbConn);
+        _sqlCommand.Parameters.AddWithValue("@files", _allFiles);
+        _sqlCommand.Parameters.AddWithValue("@num", _ticketNum);
+        _sqlCommand.Parameters.AddWithValue("@seq", seq);
+        _sqlCommand.ExecuteNonQuery();
     }
 }

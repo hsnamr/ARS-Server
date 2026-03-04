@@ -1,42 +1,52 @@
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Text;
 using System.Net;
 using System.Net.Mail;
-namespace RemedyServer
+
+namespace RemedyServer;
+
+internal static class MailSender
 {
-    class Mail_Sender
+    // TODO: Move to configuration (e.g. appsettings.json, environment variables)
+    private const string SmtpHost = "smtp.kfupm.edu.sa";
+    private const int SmtpPort = 25;
+
+    public static void SendMail(string from, string to, string subject, string body)
     {
-        
-        public static void SendMail(string from, string to, string subject, string body)
+        try
         {
-            try
+            var mail = new MailMessage(
+                from,
+                to,
+                subject,
+                body);
+            using var client = new SmtpClient(SmtpHost, SmtpPort);
+            client.Credentials = new NetworkCredential("s235865", "s235865");
+            client.SendCompleted += (sender, e) =>
             {
-                MailMessage mail= new MailMessage();
-                SmtpClient client;
-                mail.From = new MailAddress(from);
-                mail.To.Add(new MailAddress(to));
-                mail.Subject = subject;
-                mail.Body = body;
-                client = new SmtpClient("smtp.kfupm.edu.sa",25);
-                client.Credentials = new NetworkCredential("s235865", "s235865");// not secure but when encoded to EXE and protected no problem
-                client.SendCompleted += new SendCompletedEventHandler(SendCompletedCallback);
-                client.SendAsync(mail, null);
-            }
-            catch
-            {
-                Console.WriteLine(" Not able to send the message");
-            }
+                try
+                {
+                    if (e.UserState is MailMessage m)
+                        m.Dispose();
+                }
+                finally
+                {
+                    SendCompletedCallback(sender, e);
+                }
+            };
+            client.SendAsync(mail, mail);
         }
-        public static void SendCompletedCallback(object sender, AsyncCompletedEventArgs e)
+        catch (Exception ex)
         {
-            if (e.Cancelled)
-                Console.WriteLine("Send Operation Cancelled", "Error Sending Message");
-            else if (e.Error != null)
-                Console.WriteLine(e.Error.ToString(), "Error Sending Message");
-            else
-                Console.WriteLine("Mail Sent Successfully", "Good News");
+            Console.WriteLine($"Not able to send the message: {ex.Message}");
         }
+    }
+
+    private static void SendCompletedCallback(object sender, System.ComponentModel.AsyncCompletedEventArgs e)
+    {
+        if (e.Cancelled)
+            Console.WriteLine("Send operation cancelled");
+        else if (e.Error is { } err)
+            Console.WriteLine($"Error sending message: {err.Message}");
+        else
+            Console.WriteLine("Mail sent successfully");
     }
 }

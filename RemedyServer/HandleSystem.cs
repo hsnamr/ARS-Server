@@ -1,79 +1,83 @@
-using System;
-using System.Net;
-using System.Net.Sockets;
-using System.IO;
-using System.Threading;
-using System.Data;
 using System.Data.Odbc;
 
-namespace RemedyServer
+namespace RemedyServer;
+
+internal sealed class HandleSystem
 {
-    class HandleSystem
+    private readonly OdbcConnection _dbConn;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+
+    private OdbcCommand? _sqlCommand;
+    private string? _line;
+    private string? _userName;
+    private string? _leaderName;
+    private string? _password;
+    private string? _email;
+
+    public HandleSystem(OdbcConnection dbConn, StreamReader reader, StreamWriter writer)
     {
-        private StreamReader reader;
-        private StreamWriter writer;
-        private OdbcConnection dbConn;
-        private OdbcCommand sqlCommand;
-        private string line= "", command, userName, password, email;
-        public HandleSystem(OdbcConnection dbConn, StreamReader reader, StreamWriter writer)
+        _dbConn = dbConn;
+        _reader = reader;
+        _writer = writer;
+        BeginHandling();
+    }
+
+    public void BeginHandling()
+    {
+        do
         {
-            this.dbConn = dbConn;
-            this.reader = reader;
-            this.writer = writer;
-            BeginHandling();
-        }
-        public void BeginHandling()
-        {
-            do
+            _line = _reader.ReadLine();
+            switch (_line)
             {
-                line = reader.ReadLine();
-                switch (line)
-                {
-                    case "Create Leader":
-                        try
-                        {
-                            userName = reader.ReadLine();
-                            email = reader.ReadLine();
-                            password = reader.ReadLine();
-                            command = "INSERT INTO User_Information Values('" + userName + "','" + email + "','" + password + "','Leader')";//name,email,pass
-                            sqlCommand = new OdbcCommand(command, dbConn);
-                            sqlCommand.ExecuteNonQuery();
-                            writer.WriteLine("OK");//I have inserted the new user
-                            writer.Flush();
-                        }
-                        catch
-                        {
-                            writer.WriteLine("Not OK");
-                            writer.Flush();
-                        }
-                        break;
+                case "Create Leader":
+                    try
+                    {
+                        _userName = _reader.ReadLine();
+                        _email = _reader.ReadLine();
+                        _password = _reader.ReadLine();
+                        _sqlCommand = new OdbcCommand("INSERT INTO User_Information VALUES(?,?,?,'Leader')", _dbConn);
+                        _sqlCommand.Parameters.AddWithValue("@name", _userName);
+                        _sqlCommand.Parameters.AddWithValue("@email", _email);
+                        _sqlCommand.Parameters.AddWithValue("@password", _password);
+                        _sqlCommand.ExecuteNonQuery();
+                        _writer.WriteLine("OK");
+                        _writer.Flush();
+                    }
+                    catch
+                    {
+                        _writer.WriteLine("Not OK");
+                        _writer.Flush();
+                    }
+                    break;
+                case "Delete Leader":
+                    try
+                    {
+                        _leaderName = _reader.ReadLine();
+                        _sqlCommand = new OdbcCommand("DELETE FROM User_Information WHERE Name=? AND Role='Leader'", _dbConn);
+                        _sqlCommand.Parameters.AddWithValue("@name", _leaderName);
+                        _sqlCommand.ExecuteNonQuery();
+                        AcceptedCommand();
+                    }
+                    catch
+                    {
+                        _writer.WriteLine("Not OK");
+                        _writer.Flush();
+                    }
+                    break;
+                case "Quit":
+                    return;
+                default:
+                    _writer.WriteLine("not known Command");
+                    _writer.Flush();
+                    break;
+            }
+        } while (true);
+    }
 
-                        case "Delete Leader":
-                            try
-                            {
-                                leaderName = reader.ReadLine();
-                                command = "DELETE FROM User_Information WHERE Name ='" + leaderName + "' AND Role = 'Leader'";
-                                sqlCommand = new OdbcCommand(command, dbConn);
-                                sqlCommand.ExecuteNonQuery();
-                                AcceptedCommand();
-                            }
-                            catch
-                            {
-                                writer.WriteLine("Not OK");
-                                writer.Flush();
-                            }
-                            break;
-
-                    case "Quit":
-                        line = "Break";
-                        break;
-
-                    default:
-                        writer.WriteLine("not known Command");
-                        writer.Flush();
-                        break;
-                }
-            } while (line != "Break");
-        }
+    private void AcceptedCommand()
+    {
+        _writer.WriteLine("OK");
+        _writer.Flush();
     }
 }
